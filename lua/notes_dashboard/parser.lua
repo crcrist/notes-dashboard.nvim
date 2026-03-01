@@ -72,4 +72,44 @@ function M.parse(path)
   return items
 end
 
+-- Extract the # Context section from a notes.md file.
+-- Returns nil if no Context section exists.
+-- Returns { status = "ready"|"working"|"blocked"|nil, lines = { string, ... } }
+function M.get_context(path)
+  local file = io.open(path, "r")
+  if not file then return nil end
+
+  local in_context = false
+  local status     = nil
+  local ctx_lines  = {}
+
+  for line in file:lines() do
+    if not in_context then
+      if line:match("^#+%s+[Cc]ontext%s*$") then
+        in_context = true
+      end
+    else
+      if line:match("^#+%s") then break end  -- next section ends context
+
+      local s = line:match("^[Ss]tatus:%s*(.-)%s*$")
+      if s and not status then
+        status = s:lower()
+      elseif not (line:match("^%s*$") and #ctx_lines == 0) then
+        -- skip leading blank lines; include everything else
+        table.insert(ctx_lines, line)
+      end
+    end
+  end
+
+  file:close()
+  if not in_context then return nil end
+
+  -- trim trailing blank lines
+  while #ctx_lines > 0 and ctx_lines[#ctx_lines]:match("^%s*$") do
+    table.remove(ctx_lines)
+  end
+
+  return { status = status, lines = ctx_lines }
+end
+
 return M

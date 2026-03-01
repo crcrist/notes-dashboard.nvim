@@ -3,38 +3,46 @@ local M = {}
 local scanner = require("notes_dashboard.scanner")
 local parser  = require("notes_dashboard.parser")
 
--- State (reset on each render)
 local state = {
   bufnr    = nil,
   winnr    = nil,
-  line_map = {},  -- 1-indexed line → notes path
-  task_map = {},  -- 1-indexed line → { path, file_line, done }
-  cwd      = nil, -- captured at render time for [n] new notes
-  watchers = {},  -- libuv fs_event handles, stopped on close
+  line_map = {},
+  task_map = {},
+  cwd      = nil,
+  watchers = {},
 }
 
--- Collapse state persists across renders within a session
-local collapsed = {}  -- notes path → bool
-
--- Debounce flag for watcher-triggered refreshes
+local collapsed       = {}   -- notes path → bool, persists across renders
 local refresh_pending = false
+local show_done       = false  -- toggle with [d], persists across renders
 
-local ns = vim.api.nvim_create_namespace("notes_dashboard")
-
+local ns        = vim.api.nvim_create_namespace("notes_dashboard")
 local BAR_WIDTH = 20
+local ITEM_CAP  = 10  -- max items rendered per project before "... N more"
+
+-- Status display config
+local STATUS_LABEL = { ready = "● READY", working = "● WORKING", blocked = "● BLOCKED" }
+local STATUS_HL    = {
+  ready   = "NotesDashboardStatusReady",
+  working = "NotesDashboardStatusWorking",
+  blocked = "NotesDashboardStatusBlocked",
+}
 
 local function setup_highlights()
-  vim.api.nvim_set_hl(0, "NotesDashboardBorder",       { link = "FloatBorder", default = true })
-  vim.api.nvim_set_hl(0, "NotesDashboardProject",       { bold = true, default = true })
-  vim.api.nvim_set_hl(0, "NotesDashboardHeader",        { bold = true, link = "Title", default = true })
-  vim.api.nvim_set_hl(0, "NotesDashboardDone",          { link = "Comment", default = true })
-  vim.api.nvim_set_hl(0, "NotesDashboardPending",       { link = "Normal", default = true })
-  vim.api.nvim_set_hl(0, "NotesDashboardTimestamp",     { link = "Comment", default = true })
-  vim.api.nvim_set_hl(0, "NotesDashboardItem",          { link = "Normal", default = true })
-  vim.api.nvim_set_hl(0, "NotesDashboardProgressFill",  { link = "String", default = true })
-  vim.api.nvim_set_hl(0, "NotesDashboardProgressEmpty", { link = "Comment", default = true })
-  vim.api.nvim_set_hl(0, "NotesDashboardAgent",         { link = "Special", default = true })
-  vim.api.nvim_set_hl(0, "NotesDashboardEmpty",         { link = "Comment", default = true })
+  vim.api.nvim_set_hl(0, "NotesDashboardBorder",        { link = "FloatBorder",    default = true })
+  vim.api.nvim_set_hl(0, "NotesDashboardProject",        { bold = true,             default = true })
+  vim.api.nvim_set_hl(0, "NotesDashboardHeader",         { bold = true, link = "Title", default = true })
+  vim.api.nvim_set_hl(0, "NotesDashboardDone",           { link = "Comment",        default = true })
+  vim.api.nvim_set_hl(0, "NotesDashboardPending",        { link = "Normal",         default = true })
+  vim.api.nvim_set_hl(0, "NotesDashboardTimestamp",      { link = "Comment",        default = true })
+  vim.api.nvim_set_hl(0, "NotesDashboardItem",           { link = "Normal",         default = true })
+  vim.api.nvim_set_hl(0, "NotesDashboardProgressFill",   { link = "String",         default = true })
+  vim.api.nvim_set_hl(0, "NotesDashboardProgressEmpty",  { link = "Comment",        default = true })
+  vim.api.nvim_set_hl(0, "NotesDashboardAgent",          { link = "Special",        default = true })
+  vim.api.nvim_set_hl(0, "NotesDashboardEmpty",          { link = "Comment",        default = true })
+  vim.api.nvim_set_hl(0, "NotesDashboardStatusReady",    { link = "DiagnosticOk",   default = true })
+  vim.api.nvim_set_hl(0, "NotesDashboardStatusWorking",  { link = "DiagnosticWarn", default = true })
+  vim.api.nvim_set_hl(0, "NotesDashboardStatusBlocked",  { link = "DiagnosticError",default = true })
 end
 
 local function format_age(path)
@@ -64,8 +72,7 @@ local function toggle_task(path, file_line, done)
   vim.fn.writefile(lines, path)
 end
 
--- "fix bug (agent-1)" → "fix bug", "agent-1"
--- "fix bug"           → "fix bug", nil
+-- "fix bug (agent-1)" → "fix bug", "agent-1" / "fix bug" → "fix bug", nil
 local function parse_agent_tag(text)
   local main, agent = text:match("^(.-)%s+%(([^)]+)%)%s*$")
   if main then return main, agent end
@@ -76,6 +83,41 @@ local function pad_to(str, width)
   return str .. string.rep(" ", math.max(0, width - vim.fn.strdisplaywidth(str)))
 end
 
+-- Truncate str to `width` display columns, appending … if clipped
+local function truncate_to(str, width)
+  if vim.fn.strdisplaywidth(str) <= width then return str end
+  local out = vim.fn.strcharpart(str, 0, width - 1)
+  while vim.fn.strdisplaywidth(out) > width - 1 do
+    out = vim.fn.strcharpart(out, 0, vim.fn.strchars(out) - 1)
+  end
+  return out .. "…"
+end
+
+-- Word-wrap a list of strings to fit within `width` display columns
+local function wrap_text(text_lines, width)
+  local result = {}
+  for _, line in ipairs(text_lines) do
+    if vim.fn.strdisplaywidth(line) <= width then
+      table.insert(result, line)
+    else
+      local current, current_w = "", 0
+      for word in line:gmatch("%S+") do
+        local ww = vim.fn.strdisplaywidth(word)
+        if current_w == 0 then
+          current, current_w = word, ww
+        elseif current_w + 1 + ww <= width then
+          current, current_w = current .. " " .. word, current_w + 1 + ww
+        else
+          table.insert(result, current)
+          current, current_w = word, ww
+        end
+      end
+      if current_w > 0 then table.insert(result, current) end
+    end
+  end
+  return result
+end
+
 local function stop_watchers()
   for _, w in ipairs(state.watchers) do
     pcall(function() w:stop(); w:close() end)
@@ -83,11 +125,20 @@ local function stop_watchers()
   state.watchers = {}
 end
 
--- Build buffer lines + highlights from notes entries.
--- Returns: lines, highlights, line_map, task_map, total_pending
+-- Build a single-column content line: │ <content padded to text_w> │
+-- display width = win_width, text_w = win_width - 4
+local function make_line(content, text_w)
+  return "│ " .. pad_to(" " .. content, text_w) .. " │"
+end
+
+-- Build a two-column content line: │ <left padded> │ <right padded> │
+-- display: 1+1+left_w+1+1+right_w+1+1 = left_w+right_w+7 = win_width
+local function make_two_col_line(left_str, right_str, left_w, right_w)
+  return "│ " .. pad_to(" " .. left_str, left_w) .. " │ " .. pad_to(right_str, right_w) .. " │"
+end
+
 local function build_content(entries, win_width)
-  -- Layout: │ <space> <text_w cols of content> <space> │
-  local text_w = win_width - 4
+  local text_w = win_width - 4   -- single-column content display width
 
   local lines, highlights, line_map, task_map = {}, {}, {}, {}
   local total_pending = 0
@@ -101,19 +152,12 @@ local function build_content(entries, win_width)
     table.insert(highlights, { idx, cs, ce, group })
   end
 
-  -- Wrap content in box sides. Display width = win_width.
-  local function make_line(content)
-    return "│ " .. pad_to(" " .. content, text_w) .. " │"
-    -- bytes: │(3)+sp(1) + padded + sp(1)+│(3)
-    -- display: 1+1 + text_w + 1+1 = win_width ✓
-  end
-
-  add("") -- top padding
+  add("")  -- top padding
 
   -- EMPTY STATE
   if #entries == 0 then
-    local l1 = make_line("No notes.md files found in open buffers")
-    local l2 = make_line("Press [n] to create one for the current project")
+    local l1 = make_line("No notes.md files found in open buffers", text_w)
+    local l2 = make_line("Press [n] to create one for the current project", text_w)
     add(l1, nil); hl(#lines - 1, 3, #l1 - 3, "NotesDashboardEmpty")
     add(l2, nil); hl(#lines - 1, 3, #l2 - 3, "NotesDashboardEmpty")
     add("")
@@ -127,7 +171,7 @@ local function build_content(entries, win_width)
     local is_collapsed = collapsed[entry.path]
     local indicator    = is_collapsed and "▸ " or "▾ "
 
-    -- TOP BORDER: ╭─ ▸/▾ project_name  display_dir ──── age ─╮
+    -- TOP BORDER ────────────────────────────────────────────────────────────
     local fill_w     = win_width - 2
     local left_text  = "─ " .. indicator .. project_name .. "  " .. display_dir .. " "
     local right_text = " " .. age .. " ─"
@@ -139,62 +183,79 @@ local function build_content(entries, win_width)
     local top_idx = #lines
     add(top, entry.path)
     hl(top_idx, 0, -1, "NotesDashboardBorder")
-    -- project_name byte offset: ╭(3)+─(3)+sp(1)+indicator(▸/▾=3+sp=1=4) = 11
+    -- ╭(3)+─(3)+sp(1)+indicator(▸/▾=3+sp=1→4) = byte 11 for project_name
     hl(top_idx, 11, 11 + #project_name, "NotesDashboardProject")
     -- age ends 7 bytes before end: sp(1)+─(3)+╮(3) = 7
     hl(top_idx, #top - 7 - #age, #top - 7, "NotesDashboardTimestamp")
 
-    local bot = "╰" .. string.rep("─", win_width - 2) .. "╯"
-
+    -- Collapsed: just show bottom border and move on ───────────────────────
     if is_collapsed then
       local bi = #lines
-      add(bot, entry.path)
+      add("╰" .. string.rep("─", win_width - 2) .. "╯", entry.path)
       hl(bi, 0, -1, "NotesDashboardBorder")
-    else
-      local items = parser.parse(entry.path)
-      local total_tasks, done_tasks = 0, 0
+      if i < #entries then add("", nil) end
+      goto continue
+    end
+
+    -- Parse items and count tasks ──────────────────────────────────────────
+    local items = parser.parse(entry.path)
+    local total_tasks, done_tasks = 0, 0
+    for _, it in ipairs(items) do
+      if it.type == "task" then
+        total_tasks = total_tasks + 1
+        if it.done then done_tasks = done_tasks + 1
+        else total_pending = total_pending + 1 end
+      end
+    end
+
+    -- PROGRESS BAR (full-width, always above any column split) ─────────────
+    if total_tasks > 0 then
+      local filled = math.floor((done_tasks / total_tasks) * BAR_WIDTH)
+      local bar = make_line(
+        "[" .. string.rep("█", filled) .. string.rep("░", BAR_WIDTH - filled)
+        .. "] " .. done_tasks .. "/" .. total_tasks,
+        text_w
+      )
+      local bi = #lines
+      add(bar, entry.path)
+      hl(bi, 0, 3, "NotesDashboardBorder")
+      hl(bi, #bar - 3, #bar, "NotesDashboardBorder")
+      -- fill: │(3)+sp(1)+sp(1)+[(1) = byte 6; █/░ are 3 bytes each in UTF-8
+      hl(bi, 6, 6 + filled * 3,          "NotesDashboardProgressFill")
+      hl(bi, 6 + filled * 3, 6 + BAR_WIDTH * 3, "NotesDashboardProgressEmpty")
+    end
+
+    -- Check for a Context section ──────────────────────────────────────────
+    local context = parser.get_context(entry.path)
+
+    if not context then
+      -- ── SINGLE COLUMN ───────────────────────────────────────────────────
+      local visible, hidden_count = {}, 0
       for _, it in ipairs(items) do
-        if it.type == "task" then
-          total_tasks = total_tasks + 1
-          if it.done then done_tasks = done_tasks + 1
-          else total_pending = total_pending + 1 end
+        if it.type == "task" and it.done and not show_done then
+          -- skip done tasks when hidden
+        elseif #visible < ITEM_CAP then
+          table.insert(visible, it)
+        else
+          hidden_count = hidden_count + 1
         end
       end
 
-      -- PROGRESS BAR
-      if total_tasks > 0 then
-        local filled = math.floor((done_tasks / total_tasks) * BAR_WIDTH)
-        local bar = make_line(
-          "[" .. string.rep("█", filled) .. string.rep("░", BAR_WIDTH - filled)
-          .. "] " .. done_tasks .. "/" .. total_tasks
-        )
-        local bi = #lines
-        add(bar, entry.path)
-        hl(bi, 0, 3, "NotesDashboardBorder")
-        hl(bi, #bar - 3, #bar, "NotesDashboardBorder")
-        -- fill byte offset: │(3)+sp(1)+sp(1)+[(1) = 6
-        -- █ and ░ are 3 bytes each in UTF-8
-        hl(bi, 6, 6 + filled * 3,        "NotesDashboardProgressFill")
-        hl(bi, 6 + filled * 3, 6 + BAR_WIDTH * 3, "NotesDashboardProgressEmpty")
-      end
-
-      -- ITEMS
-      for _, it in ipairs(items) do
+      for _, it in ipairs(visible) do
         local fl
         if it.type == "task" then
           local icon       = it.done and "☑" or "☐"
           local txt, agent = parse_agent_tag(it.text)
           local content    = icon .. " " .. txt
           if agent then content = content .. " (" .. agent .. ")" end
-          fl = make_line(content)
+          fl = make_line(content, text_w)
           local item_hl = it.done and "NotesDashboardDone" or "NotesDashboardPending"
           local ti = #lines
           add(fl, entry.path)
           hl(ti, 0, 3, "NotesDashboardBorder")
           hl(ti, 3, #fl - 3, item_hl)
           hl(ti, #fl - 3, #fl, "NotesDashboardBorder")
-          -- agent tag byte offset: │(3)+sp(1)+sp(1)+icon(3)+sp(1)+txt(#txt)+sp(1) = 10+#txt
-          -- tag = "(" + agent + ")" = #agent+2 bytes
+          -- agent: │(3)+sp(1)+sp(1)+icon(3)+sp(1)+txt+sp(1) = byte 10+#txt
           if agent then
             local ts = 10 + #txt
             hl(ti, ts, ts + #agent + 2, "NotesDashboardAgent")
@@ -202,7 +263,7 @@ local function build_content(entries, win_width)
           task_map[#lines] = { path = entry.path, file_line = it.line_num, done = it.done }
 
         elseif it.type == "header" then
-          fl = make_line(string.rep("#", it.level) .. " " .. it.text)
+          fl = make_line(string.rep("#", it.level) .. " " .. it.text, text_w)
           local ii = #lines
           add(fl, entry.path)
           hl(ii, 0, 3, "NotesDashboardBorder")
@@ -210,7 +271,7 @@ local function build_content(entries, win_width)
           hl(ii, #fl - 3, #fl, "NotesDashboardBorder")
 
         elseif it.type == "item" then
-          fl = make_line(" - " .. it.text)
+          fl = make_line(" - " .. it.text, text_w)
           local ii = #lines
           add(fl, entry.path)
           hl(ii, 0, 3, "NotesDashboardBorder")
@@ -218,7 +279,7 @@ local function build_content(entries, win_width)
           hl(ii, #fl - 3, #fl, "NotesDashboardBorder")
 
         else
-          fl = make_line(it.text)
+          fl = make_line(it.text, text_w)
           local ii = #lines
           add(fl, entry.path)
           hl(ii, 0, 3, "NotesDashboardBorder")
@@ -227,15 +288,183 @@ local function build_content(entries, win_width)
         end
       end
 
+      if hidden_count > 0 then
+        local more = make_line("  ... " .. hidden_count .. " more", text_w)
+        local mi = #lines
+        add(more, entry.path)
+        hl(mi, 0, 3, "NotesDashboardBorder")
+        hl(mi, 3, #more - 3, "NotesDashboardEmpty")
+        hl(mi, #more - 3, #more, "NotesDashboardBorder")
+      end
+
       local bi = #lines
+      add("╰" .. string.rep("─", win_width - 2) .. "╯", entry.path)
+      hl(bi, 0, -1, "NotesDashboardBorder")
+
+    else
+      -- ── TWO COLUMN ──────────────────────────────────────────────────────
+      -- Layout: │ sp left_w sp │ sp right_w sp │  → total = left_w+right_w+7 = win_width
+      local left_w  = math.floor((win_width - 7) * 0.55)
+      local right_w = (win_width - 7) - left_w
+
+      -- Collect left column items (everything before # Context header)
+      local left_items = {}
+      local hit_context = false
+      for _, it in ipairs(items) do
+        if it.type == "header" and it.text:lower() == "context" then
+          hit_context = true
+        end
+        if not hit_context then table.insert(left_items, it) end
+      end
+
+      -- Filter and cap left column items
+      local visible_left, hidden_count = {}, 0
+      for _, it in ipairs(left_items) do
+        if it.type == "task" and it.done and not show_done then
+          -- skip
+        elseif #visible_left < ITEM_CAP then
+          table.insert(visible_left, it)
+        else
+          hidden_count = hidden_count + 1
+        end
+      end
+
+      -- Build left column structs
+      local left_col = {}
+      for _, it in ipairs(visible_left) do
+        if it.type == "task" then
+          local icon       = it.done and "☑" or "☐"
+          local txt, agent = parse_agent_tag(it.text)
+          local content    = icon .. " " .. txt
+          if agent then content = content .. " (" .. agent .. ")" end
+          table.insert(left_col, {
+            content  = content,
+            hl       = it.done and "NotesDashboardDone" or "NotesDashboardPending",
+            task     = { path = entry.path, file_line = it.line_num, done = it.done },
+            agent    = agent,
+            txt      = txt,
+          })
+        elseif it.type == "header" then
+          table.insert(left_col, {
+            content = string.rep("#", it.level) .. " " .. it.text,
+            hl      = "NotesDashboardHeader",
+          })
+        elseif it.type == "item" then
+          table.insert(left_col, { content = " - " .. it.text, hl = "NotesDashboardItem" })
+        else
+          table.insert(left_col, { content = it.text, hl = "NotesDashboardItem" })
+        end
+      end
+      if hidden_count > 0 then
+        table.insert(left_col, {
+          content = "  ... " .. hidden_count .. " more",
+          hl      = "NotesDashboardEmpty",
+        })
+      end
+
+      -- Build right column rows: status + divider + wrapped context text
+      -- row type: "status" | "divider" | "text"
+      local right_col = {}
+      if context.status then
+        table.insert(right_col, { type = "status", status = context.status })
+        table.insert(right_col, { type = "divider" })
+      end
+      for _, l in ipairs(wrap_text(context.lines, right_w)) do
+        table.insert(right_col, { type = "text", text = l })
+      end
+
+      -- COLUMN DIVIDER ROW: ├──────────┬──────────┤
+      local col_div = "├" .. string.rep("─", left_w + 2) .. "┬" .. string.rep("─", right_w + 2) .. "┤"
+      local cd_idx  = #lines
+      add(col_div, entry.path)
+      hl(cd_idx, 0, -1, "NotesDashboardBorder")
+
+      -- RENDER ROWS (zip left and right, padding whichever is shorter)
+      local n_rows = math.max(#left_col, #right_col)
+      for row = 1, n_rows do
+        local lc = left_col[row]
+        local rc = right_col[row]
+
+        -- truncate_to(left_w-1): -1 for the leading space prefix
+        local left_str    = lc and (" " .. truncate_to(lc.content, left_w - 1)) or " "
+        local left_padded = pad_to(left_str, left_w)
+
+        if rc and rc.type == "divider" then
+          -- Status separator: left side normal, right side becomes ├────┤
+          -- "│ " + left_padded + " ├" + "─"*(right_w+2) + "┤"
+          local div_line = "│ " .. left_padded .. " ├" .. string.rep("─", right_w + 2) .. "┤"
+          local di = #lines
+          add(div_line, entry.path)
+          hl(di, 0, 3, "NotesDashboardBorder")
+          if lc then hl(di, 4, 4 + #left_padded, lc.hl) end
+          -- " ├" starts at byte 4+#left_padded+1; highlight rest as border
+          hl(di, 4 + #left_padded + 1, #div_line, "NotesDashboardBorder")
+          if lc and lc.task then task_map[#lines] = lc.task end
+
+        else
+          -- Normal two-column line
+          local right_str    = ""
+          local right_hl_grp = nil
+          if rc then
+            if rc.type == "status" then
+              right_str    = STATUS_LABEL[rc.status] or ("● " .. rc.status:upper())
+              right_hl_grp = STATUS_HL[rc.status]
+            elseif rc.type == "text" then
+              right_str    = rc.text
+              right_hl_grp = "NotesDashboardItem"
+            end
+          end
+
+          local right_padded = pad_to(right_str, right_w)
+          local fl = "│ " .. left_padded .. " │ " .. right_padded .. " │"
+          -- Byte layout:
+          --   │(3) sp(1) = 4B
+          --   left_padded = #left_padded B
+          --   sp(1) │(3) sp(1) = 5B  ← inner sep at byte 4+#left_padded+1
+          --   right_padded = #right_padded B
+          --   sp(1) │(3) = 4B
+
+          local fi         = #lines
+          local inner_byte = 4 + #left_padded + 1  -- byte where inner │ starts
+          add(fl, entry.path)
+
+          -- Border chars
+          hl(fi, 0, 3, "NotesDashboardBorder")
+          hl(fi, inner_byte, inner_byte + 3, "NotesDashboardBorder")
+          hl(fi, #fl - 3, #fl, "NotesDashboardBorder")
+
+          -- Left content
+          if lc then
+            hl(fi, 4, 4 + #left_padded, lc.hl)
+            -- Agent tag: │(3)+sp(1)+sp(1)+icon(3)+sp(1)+txt+sp(1) → byte 10+#txt
+            if lc.agent then
+              local ts = 10 + #lc.txt
+              hl(fi, ts, ts + #lc.agent + 2, "NotesDashboardAgent")
+            end
+          end
+
+          -- Right content: starts after inner │(3)+sp(1) = inner_byte+4
+          if right_hl_grp then
+            local rs = inner_byte + 4
+            hl(fi, rs, rs + #right_padded, right_hl_grp)
+          end
+
+          if lc and lc.task then task_map[#lines] = lc.task end
+        end
+      end
+
+      -- BOTTOM BORDER WITH COLUMN SPLIT: ╰──────┴──────╯
+      local bot = "╰" .. string.rep("─", left_w + 2) .. "┴" .. string.rep("─", right_w + 2) .. "╯"
+      local bi  = #lines
       add(bot, entry.path)
       hl(bi, 0, -1, "NotesDashboardBorder")
     end
 
     if i < #entries then add("", nil) end
+    ::continue::
   end
 
-  add("") -- bottom padding
+  add("")  -- bottom padding
   return lines, highlights, line_map, task_map, total_pending
 end
 
@@ -283,7 +512,7 @@ function M.render()
     border     = "rounded",
     title      = title,
     title_pos  = "left",
-    footer     = "  [e] edit  [<Space>] toggle  [a] add task  [<Tab>] collapse  [r] refresh  [n] new notes  [q] close  ",
+    footer     = "  [e] edit  [<Space>] toggle  [a] add  [d] done  [<Tab>] collapse  [r] refresh  [n] new  [q] close  ",
     footer_pos = "center",
   })
 
@@ -302,8 +531,8 @@ function M.render()
   map("q",     function() M.close() end, "Close")
   map("<Esc>", function() M.close() end, "Close")
   map("r",     function() M.render() end, "Refresh")
+  map("d",     function() show_done = not show_done; M.render() end, "Toggle done tasks")
 
-  -- Open notes.md under cursor
   local function open_notes()
     local path = state.line_map[vim.api.nvim_win_get_cursor(winnr)[1]]
     if path then
@@ -314,7 +543,6 @@ function M.render()
   map("e",    open_notes, "Edit notes.md")
   map("<CR>", open_notes, "Edit notes.md")
 
-  -- Toggle task checkbox
   map("<Space>", function()
     local cursor = vim.api.nvim_win_get_cursor(state.winnr)[1]
     local task   = state.task_map[cursor]
@@ -329,7 +557,6 @@ function M.render()
     end
   end, "Toggle task")
 
-  -- Collapse/expand project under cursor
   map("<Tab>", function()
     local path = state.line_map[vim.api.nvim_win_get_cursor(state.winnr)[1]]
     if path then
@@ -343,20 +570,30 @@ function M.render()
     end
   end, "Collapse/expand project")
 
-  -- Add task to the project under cursor
   map("a", function()
     local path = state.line_map[vim.api.nvim_win_get_cursor(state.winnr)[1]]
     if not path then return end
     vim.ui.input({ prompt = "New task: " }, function(input)
       if not input or input == "" then return end
       local file_lines = vim.fn.readfile(path)
-      table.insert(file_lines, "- [ ] " .. input)
+      -- Insert before # Context section (or append if none)
+      local insert_at = #file_lines + 1
+      for j, l in ipairs(file_lines) do
+        if l:match("^#+%s+[Cc]ontext%s*$") then
+          insert_at = j
+          -- place before any blank line that precedes the header
+          if j > 1 and file_lines[j - 1]:match("^%s*$") then
+            insert_at = j - 1
+          end
+          break
+        end
+      end
+      table.insert(file_lines, insert_at, "- [ ] " .. input)
       vim.fn.writefile(file_lines, path)
       M.render()
     end)
   end, "Add task")
 
-  -- Create notes.md in cwd, or open it if it already exists
   map("n", function()
     local notes_path = state.cwd .. "/notes.md"
     if vim.fn.filereadable(notes_path) == 1 then
@@ -369,7 +606,6 @@ function M.render()
     M.render()
   end, "Create/open notes.md for cwd")
 
-  -- Auto-close when leaving the window
   vim.api.nvim_create_autocmd("WinLeave", {
     buffer   = bufnr,
     once     = true,
