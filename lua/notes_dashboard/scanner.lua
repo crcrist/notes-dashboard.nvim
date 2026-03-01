@@ -56,6 +56,13 @@ function M.get_active_notes()
     ::continue::
   end
 
+  -- Sort by most recently modified so the active project floats to the top
+  table.sort(results, function(a, b)
+    local sa = vim.loop.fs_stat(a.path)
+    local sb = vim.loop.fs_stat(b.path)
+    return (sa and sa.mtime.sec or 0) > (sb and sb.mtime.sec or 0)
+  end)
+
   return results
 end
 
