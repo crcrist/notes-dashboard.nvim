@@ -2,7 +2,7 @@
 
 A Neovim plugin that surfaces your project notes in a floating dashboard — without you having to go find them.
 
-![notes-dashboard screenshot](Screenshot%202026-03-01%20125043.png)
+![notes-dashboard screenshot](Screenshot%202026-03-01%20125044.png)
 
 ---
 
