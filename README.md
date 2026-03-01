@@ -60,6 +60,26 @@ Inside the dashboard:
 | `r` | Refresh the dashboard |
 | `q` or `<Esc>` | Close |
 
+### Showing multiple projects
+
+The dashboard picks up any project that has a loaded buffer. To load files from multiple projects at once:
+
+```
+:tabedit /path/to/other-project/src/main.lua   " open a file from another project in a new tab
+:e /path/to/other-project/src/main.lua         " or open it in the current window
+```
+
+Once those buffers are loaded, open the dashboard and all matching `notes.md` files will appear as separate cards.
+
+**Useful buffer commands:**
+
+| Command | Action |
+|---------|--------|
+| `:ls` | List all open buffers |
+| `:bd` | Close the current buffer |
+| `:bd 3` | Close buffer number 3 (use number from `:ls`) |
+| `:tabclose` | Close the current tab |
+
 ---
 
 ## notes.md format
